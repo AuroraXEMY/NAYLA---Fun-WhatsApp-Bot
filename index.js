@@ -417,7 +417,7 @@ async function evaluateMessage(sender, text) {
 /**
  * Initialize WhatsApp Socket
  */
-asasync function startBot() {
+async function startBot() {
   const fs = require('fs');
   const authFolder = "./session_auth";
 
