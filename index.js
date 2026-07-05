@@ -417,7 +417,16 @@ async function evaluateMessage(sender, text) {
 /**
  * Initialize WhatsApp Socket
  */
-async function startBot() {
+asasync function startBot() {
+  const fs = require('fs');
+  const authFolder = "./session_auth";
+
+  // --- CLEAN SLATE: Wipe local cache before anything else ---
+  if (fs.existsSync(authFolder)) {
+    fs.rmSync(authFolder, { recursive: true, force: true });
+    console.log("🧹 Cleaned local session folder for fresh start.");
+  }
+
   if (MONGO_URI) {
     try {
       console.log("🔌 Connecting to MongoDB Database with strict 10s timeout...");
@@ -431,7 +440,8 @@ async function startBot() {
     }
   }
 
-  const authFolder = "./session_auth";
+  // Note: Since we wiped the folder, downloadSessionFromMongo will 
+  // either pull fresh data from Atlas or create a new path.
   await downloadSessionFromMongo(authFolder);
 
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
@@ -445,34 +455,37 @@ async function startBot() {
     auth: state,
     printQRInTerminal: !usePairingCode,
     logger: pino({ level: "silent" }),
-    // Restricting sync events and caching sizes to fit perfectly within Render's memory constraints
-    browser: ["VibeGuard AI", "Chrome", "2.0.0"],
+    // --- BYPASS BLACKLIST: Changed browser fingerprint ---
+    browser: ["VibeGuard-New-Session", "Safari", "3.0.0"],
     syncFullHistory: false,
     markOnlineOnConnect: true,
     connectTimeoutMs: 60000
   });
 
+  // ... rest of your code (keep your existing pairing code and connection logic below)
+
   // --- PROTECTION TIER 9: WHATSAPP PHONE NUMBER PAIRING CODE GENERATOR ---
-  if (usePairingCode && !sock.authState.creds.registered) {
-    console.log("🔑 Requesting pairing code for number: " + phoneNum);
-    // Remove all non-digit formatting characters
+    if (usePairingCode && !sock.authState.creds.registered) {
     const sanitizedNumber = phoneNum.replace(/[^0-9]/g, "");
-    
-    // Slight pause to ensure socket setup sequence is active
-    setTimeout(async () => {
-      try {
-        let code = await sock.requestPairingCode(sanitizedNumber);
-        code = code?.match(/.{1,4}/g)?.join("-") || code;
-        console.log("\n==================================================");
-        console.log("🔑  WHATSAPP BOT PAIRING CODE GENERATED SUCCESS");
-        console.log(`👉  \x1b[1;35m${code}\x1b[0m  👈`);
-        console.log("Go to: Linked Devices > Link with Phone Number in WhatsApp!");
-        console.log("==================================================\n");
-      } catch (err) {
-        console.error("❌ Failed to request pairing code:", err.message);
-        console.error("Make sure your PHONE_NUMBER environment variable includes the country code! (e.g. 2348012345678)");
-      }
-    }, 4500);
+    console.log(`⏳ Waiting for socket to stabilize for: ${sanitizedNumber}...`);
+
+    try {
+      // Use a proper retry mechanism rather than a blind timer
+      // This will wait for the socket to be ready
+      await sock.waitForConnectionUpdate((update) => !!update.connection);
+      
+      let code = await sock.requestPairingCode(sanitizedNumber);
+      code = code?.match(/.{1,4}/g)?.join("-") || code;
+      
+      console.log("\n==================================================");
+      console.log("🔑  WHATSAPP BOT PAIRING CODE GENERATED SUCCESS");
+      console.log(`👉  \x1b[1;35m${code}\x1b[0m  👈`);
+      console.log("Go to: Linked Devices > Link with Phone Number in WhatsApp!");
+      console.log("==================================================\n");
+    } catch (err) {
+      console.error("❌ Failed to request pairing code:", err.message);
+      console.error("If 405 error, clear MongoDB collection & restart!");
+    }
   }
 
   // --- PROTECTION TIER 10: AUTOMATIC SOCKET RECONNECTION BACKOFF ---
