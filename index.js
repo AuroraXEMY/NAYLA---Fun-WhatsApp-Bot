@@ -448,6 +448,31 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 8;
 let stabilityTimer = null; // only reset reconnectAttempts once a connection proves it's actually stable
 
+// --- MESSAGE CONTENT EXTRACTOR (UNWRAPS DISAPPEARING / VIEW-ONCE CONTAINERS) ---
+// Baileys nests disappearing-message and view-once content one level deeper than
+// a normal message: msg.message.ephemeralMessage.message.conversation, NOT
+// msg.message.conversation directly. The old extraction line only ever checked
+// the top level, so for any chat with disappearing messages on (WhatsApp now
+// defaults many chats to this), text came back as "" and `if (!text) continue;`
+// silently skipped the message *before* the "📬 Message from..." log line ever
+// ran — which is exactly why nothing showed up, even though messages.upsert
+// was firing correctly the whole time.
+function unwrapMessageContent(message) {
+  if (!message) return null;
+  const containerType = Object.keys(message)[0];
+  const wrapperTypes = ["ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "viewOnceMessageV2Extension"];
+  if (wrapperTypes.includes(containerType) && message[containerType]?.message) {
+    return unwrapMessageContent(message[containerType].message);
+  }
+  return message;
+}
+
+function extractTextFromMessage(message) {
+  const content = unwrapMessageContent(message);
+  if (!content) return "";
+  return content.conversation || content.extendedTextMessage?.text || "";
+}
+
 async function startBot() {
   console.log("==================================================");
   console.log("⚡ VIBEGUARD WHATSAPP PERSISTENT MODERATOR STARTING");
@@ -580,7 +605,7 @@ async function startBot() {
       if (!msg.message || msg.key.fromMe) continue;
 
       const jid = msg.key.remoteJid;
-      const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "";
+      const text = extractTextFromMessage(msg.message);
       const sender = msg.pushName || "Anonymous";
       const senderJid = msg.key.participant || msg.key.remoteJid;
 
