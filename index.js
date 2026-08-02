@@ -855,6 +855,17 @@ async function loadGroupConfigsFromMongo() {
 // shared something" worth a Daily Newspaper mention).
 const NOISE_PLACEHOLDER_REGEX = /^\[(video, no caption|file(: .+)?)\]$/;
 
+// Matches EVERY placeholder extractTextFromMessage() can produce for bare
+// (uncaptioned) media — "[image, no caption]", "[video, no caption]",
+// "[sticker]", "[voice note]", "[audio file]", "[file...]". Used by
+// gatherQuotedContext() to tell a genuine caption/text apart from this
+// internal filler — see the FIX comment there for why conflating the two
+// was a confirmed bug (a bare quoted image read to the model as if the
+// original message's literal text content was the string "[image, no
+// caption]", instead of as a signal "there was an image here, describe
+// it").
+const MEDIA_PLACEHOLDER_TEXT_REGEX = /^\[(image, no caption|video, no caption|sticker|voice note|audio file|file(: .+)?)\]$/;
+
 // Active conversational memory: holds the last ACTIVE_CONTEXT_CAP text
 // messages per group. Feeds AI chat replies with real context AND doubles as
 // Movie Mode's source. Once it hits the cap, the whole buffer is archived to
@@ -884,6 +895,35 @@ async function bufferGroupMessage(jid, sender, text) {
     }
     groupMessageBuffers.set(jid, []); // reset for a fresh window regardless of archive success
   }
+}
+
+// FIX (confirmed bug — "the bot isn't remembering its own canned commands":
+// asking a natural follow-up like "what does this status mean" right after
+// .stats failed, because NEITHER the .stats command itself NOR its response
+// text ever reached the conversation buffer — handleCommand() `continue`s
+// the pipeline before bufferGroupMessage() is ever called for a recognized
+// command). A generic transparent Proxy around `sock`, used only for the
+// duration of handleCommand()'s execution, captures whatever text/caption
+// any command actually sends — without needing to add a bufferGroupMessage
+// call to all 25+ individual command branches by hand, and without
+// changing any command's own behavior at all (every other property/method
+// on `sock` passes through untouched).
+function createResponseCapturingSock(sock, onTextSent) {
+  return new Proxy(sock, {
+    get(target, prop, receiver) {
+      if (prop === "sendMessage") {
+        return async (jid, content, options) => {
+          const result = await target.sendMessage(jid, content, options);
+          const text = (content && typeof content.text === "string") ? content.text
+            : (content && typeof content.caption === "string") ? content.caption
+            : null;
+          if (text) onTextSent(text);
+          return result;
+        };
+      }
+      return Reflect.get(target, prop, receiver);
+    }
+  });
 }
 
 // Returns the last `limit` buffered messages as a mini-transcript, capped
@@ -1250,6 +1290,17 @@ async function handleCommand(sock, jid, senderJid, sender, text, msg) {
       const target = resolveCommandTarget(msg.message);
       if (!target) {
         await sock.sendMessage(jid, { text: "⚠️ Reply to that person's message, or @mention them, along with the command." }, { quoted: msg });
+        return true;
+      }
+      // FIX (confirmed gap — same pattern already fixed for .ignore, see
+      // Section 13.5): replying to one of the BOT's own messages and typing
+      // .kick/.promote/.demote with no other target resolves via
+      // contextInfo.participant — whoever sent the quoted message, i.e. the
+      // bot itself. Left unchecked, an admin could accidentally have the bot
+      // try to remove/promote/demote ITSELF. Same isSelfJid() guard .ignore
+      // already uses, applied here too.
+      if (isSelfJid(sock, target)) {
+        await sock.sendMessage(jid, { text: "🤣 I can't use that on myself — reply to or @mention the PERSON you mean." }, { quoted: msg });
         return true;
       }
       const actionMap = { ".kick": "remove", ".promote": "promote", ".demote": "demote" };
@@ -1899,7 +1950,9 @@ const ActivityLog = mongoose.models.ActivityLog || mongoose.model("ActivityLog",
 // anything anymore, so blockLinks/blockSpam/toxicityThreshold config is gone.
 const BOT_CONFIG = {
   name: "Nayla 😎",
+  pronouns: "she/her", // Nayla's own persona is a girl
   creator: "Jackie",
+  creatorPronouns: "he/him", // FIX (confirmed bug): "Jackie" is a gender-ambiguous name with no signal anywhere else, so the model would sometimes guess wrong when talking ABOUT the creator — stated explicitly now so nothing has to guess
   vibe: "cool" // global fallback for DMs — groups use their own GroupConfig.mood
 };
 
@@ -2174,7 +2227,7 @@ async function analyzeImageWithGemini(base64Image, mimeType, question) {
               { type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Image}` } }
             ]
           }],
-          max_tokens: 300
+          max_tokens: 500 // FIX (confirmed bug): 300 was cutting responses off mid-sentence ("Oh my gosh, it's" / "...is completely") — free-tier models often run past a "1-3 sentences" instruction; this gives real headroom while staying a small, cheap request
         })
       }, 15000);
       if (!response.ok) {
@@ -2933,7 +2986,22 @@ function unwrapMessageContent(message) {
   // it, text extraction came back empty, and messages got skipped before ever
   // reaching the "📬 Message from..." log line. Now every wrapper type is
   // checked directly as a property, regardless of key order.
-  const wrapperTypes = ["ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "viewOnceMessageV2Extension"];
+  //
+  // FIX (confirmed root cause — "replying to the bot's own message never
+  // gets understood," reported worst in DMs and for anything quoting a
+  // command's output like .menu/.stats): "deviceSentMessage" was missing
+  // from this list. WhatsApp wraps a message that was SENT FROM A
+  // COMPANION/LINKED DEVICE — which is exactly what this bot's own WhatsApp
+  // session is — in a deviceSentMessage envelope whenever it's referenced
+  // elsewhere, e.g. quoted in a later reply: the real content sits one level
+  // deeper, at deviceSentMessage.message, not at the top level. Every
+  // quoted-content function in this file (getQuotedMessageText,
+  // getQuotedMediaType, gatherQuotedContext, downloadQuotedMedia) funnels
+  // through this one function, so this single gap explains why replying to
+  // ANY of the bot's own prior messages consistently failed to be
+  // understood — including nearly every reply in a DM (where almost
+  // everything being replied to IS a message the bot itself sent).
+  const wrapperTypes = ["ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "viewOnceMessageV2Extension", "deviceSentMessage"];
   for (const type of wrapperTypes) {
     if (message[type]?.message) {
       return unwrapMessageContent(message[type].message);
@@ -3347,13 +3415,21 @@ async function generateEli5Explanation(topic, vibe, searchContext = "", addition
   } else if (hasRealTopic) {
     userInstruction = `Explain like I'm 5: ${topic}`;
   } else if (additionalContext) {
-    userInstruction = `Here's the actual content I need explained: "${additionalContext}"\n\nExplain THAT (the content above) like I'm 5 — not the general concept of "explaining simply," the actual specific content itself.`;
+    userInstruction = `Here's the actual content I need explained: "${additionalContext}"\n\nExplain THAT (the content above) like I'm 5 — not the general concept of "explaining simply," the actual specific content itself. If it's a bot command, a status readout, an acronym, or jargon, walk through what each confusing part actually means in plain words — don't swap it out for a different, easier example topic.`;
   } else {
-    userInstruction = `Explain like I'm 5.`; // shouldn't normally be reached — the .eli5 command itself guards against having neither a topic nor quoted content
+    // FIX (confirmed bug): this used to just say "Explain like I'm 5." with
+    // literally nothing to explain — observed in production to make the
+    // model invent an unrelated, generic "textbook ELI5" topic out of thin
+    // air (e.g. a stock food/nutrition analogy) rather than admit it had
+    // nothing real to work with. This branch is meant to be unreachable
+    // (the .eli5 command itself guards against having neither a topic nor
+    // quoted content) but if it's ever hit anyway, be honest instead of
+    // free-associating.
+    userInstruction = `I was asked for an ELI5 explanation, but no real topic or usable quoted content actually came through — don't invent or explain some unrelated topic to fill the gap. In one short in-character sentence, say you're not sure what to explain and ask them to either give a topic (".eli5 <topic>") or reply to the specific message they want explained.`;
   }
   try {
     const raw = await callAIProvider([
-      { role: "system", content: `You are ${BOT_CONFIG.name}, "${vibe}" personality. Explain things like the person is 5 years old — genuinely simple, warm, vivid analogies a child could picture, but still accurate (simplify without becoming actually wrong). 3-6 sentences. No preamble like "Sure, here's an ELI5:" — just explain it directly.${searchContext ? `\n\nFresh web search results to ground this in real facts (use them naturally, don't dump raw text):\n${searchContext}` : ""}` },
+      { role: "system", content: `You are ${BOT_CONFIG.name}, "${vibe}" personality. Explain things like the person is 5 years old — genuinely simple, warm, vivid analogies a child could picture, but still accurate (simplify without becoming actually wrong). Ground the explanation in the SPECIFIC content you were actually given — never substitute a different, more familiar, or easier-to-explain topic just because it's a more common example (this has happened before: given a technical status readout to explain, drifting off into an unrelated "food is fuel for your body" analogy instead of explaining the readout itself — don't do that). If the given content is technical (a command, a status readout, an acronym, jargon), translate it term by term rather than talking around it. 3-6 sentences. No preamble like "Sure, here's an ELI5:" — just explain it directly.${searchContext ? `\n\nFresh web search results to ground this in real facts (use them naturally, don't dump raw text):\n${searchContext}` : ""}` },
       { role: "user", content: userInstruction }
     ], { json: false, temperature: 0.7, timeoutMs: 10000 });
     return raw.trim();
@@ -3373,6 +3449,25 @@ async function generateDuplicateSpamNudge(vibe) {
     return raw.trim();
   } catch (e) {
     return "Whoa, same message 3 times in a row 😅 taking a short 5-minute breather — try me again after that!";
+  }
+}
+
+// Explicit request: a document/video reply/tag must get an honest, specific,
+// AI-generated (never canned) decline — not a confused generic response
+// (the risk if it silently fell through to the general analysis pipeline,
+// which would only ever see a placeholder like "[file: report.pdf]").
+// Documents/video are a deliberate, standing scope decision (Section 15) —
+// this doesn't process them, just gives an honest answer about it instead
+// of guessing or staying silent.
+async function generateUnsupportedFileDeclineLine(vibe, fileType) {
+  const kind = fileType === "video" ? "video" : "document/file";
+  try {
+    const raw = await callAIProvider([
+      { role: "system", content: `You are ${BOT_CONFIG.name}, "${vibe}" personality. Someone just sent or replied with a ${kind} and is asking you about it — but you genuinely can't read/watch that yet (you CAN understand images, stickers, voice notes, and text — just not ${kind}s). Write ONE short, warm, funny, in-character line honestly saying you can't handle that file type yet, maybe lightly hinting it could be a future feature — without sounding robotic or making excuses. 1 sentence. Plain text only, no quotes around it.` }
+    ], { json: false, temperature: 1.0, timeoutMs: 6000 });
+    return raw.trim();
+  } catch (e) {
+    return `👀 I can't read ${kind}s just yet — maybe a future update! Send me a photo, sticker, or voice note instead, or just tell me about it.`;
   }
 }
 
@@ -3401,7 +3496,7 @@ ${describeMood(vibe)}
 ${BASELINE_TONE_RULES}
 
 Self-awareness (know this about yourself, bring it up naturally/funnily if asked — never say "no one hosts me" or that you're just floating around):
-- You were built and are hosted by your creator, ${BOT_CONFIG.creator}, on a cloud server (Render or similar) — you don't need deep infra details, just that a real person made and runs you.
+- You were built and are hosted by your creator, ${BOT_CONFIG.creator} (${BOT_CONFIG.creatorPronouns}), on a cloud server (Render or similar) — you don't need deep infra details, just that a real person made and runs you. You yourself (${BOT_CONFIG.name.replace(/\s*😎\s*/, "").trim()}) are referred to with ${BOT_CONFIG.pronouns}.
 - You CAN now search the web (results get fed to you when relevant), understand photos and stickers people send you, listen to voice notes, and generate REAL images — either via *.imagine <prompt>* or just by being asked naturally in conversation ("draw me a cat", "generate an image of the moon"). NEVER say you can't create/display/generate images, and NEVER describe yourself as "just a language model" that can only produce text — image generation is a real, working feature of yours. If this specific message is asking you for an image, that request is handled separately before you ever see it, so if you're generating this reply at all, it means the request is something else — answer THAT, don't second-guess or refuse an image capability question.
 - You can ALSO: play Truth or Dare (*.truth*/*.dare*, or just "let's play truth or dare"), share a quote (*.quote*), explain things simply (*.eli5 <topic>*), turn a replied-to image into a sticker (*.sticker*), and reply with an actual spoken voice note instead of text (*.tts*, or just ask to "explain this in a voice note") — all real, working features. If asked to reply in a voice note or play a game, that's handled separately before you ever see this prompt, so don't second-guess those either.
 - If someone replies to an existing message (an image, a link, a phone number, any combination) and asks you to explain/summarize/analyze it, you genuinely can — that's handled by a separate combined-analysis step before you ever see this prompt, so if you ARE generating this specific reply, it means something else is being asked.
@@ -3412,7 +3507,7 @@ Self-awareness (know this about yourself, bring it up naturally/funnily if asked
 TASK EXECUTION — this is important, read carefully: if the person is asking you to actually DO something (tell a story, write something, explain a topic, generate a list, quiz them, complete any concrete task), your reply must contain the ACTUAL CONTENT, not a preview of it. Never respond with only an announcement, a warm-up line, or "let's begin!"/"here we go!"/"buckle up!" with no actual substance attached — that is a failure. If they already asked and then follow up with "go", "continue", "yes", "ok", or similar short encouragement, that means produce the NEXT real chunk of content immediately, not another round of "alright, let's dive in." One clear round of setup is fine; repeating it is the bug to avoid. For a story/task reply, aim for roughly 100-300 words of real content (expand further only if they explicitly ask for more/longer) — casual chat replies stay short (1-4 sentences), but a requested task is not casual chat and should not be squeezed into that length.
 
 What you already remember about ${sender}: ${knownFacts}.
-${context ? `Recent conversation in this chat (for context only, don't repeat it back verbatim):\n${context}\n` : ""}${quotedText ? `IMPORTANT: ${sender} is directly replying to this specific earlier message — "${quotedText}" — answer THEIR question about/reaction to THAT message, don't ask what they mean.\n` : ""}${attachedMediaContext ? `IMPORTANT: ${sender} just sent THIS current message with an image directly attached to it (this is NOT a reply to something from earlier — it's brand new, right now). Here's what that image shows: ${attachedMediaContext}\nAnswer their caption/question about THIS specific image. Do not confuse this with anything mentioned earlier in the recent conversation above — this is a fresh photo, not a continuation of an earlier topic.\n` : ""}${searchContext ? `Fresh web search results for this question (use them to ground your answer in real facts, mention naturally that you looked it up, don't just dump the raw text):\n${searchContext}\n` : ""}${feelingSalty ? `Note: there's been some rudeness in this chat in the last few minutes — you're allowed to sound a little annoyed/short about it, without being genuinely mean or holding a real grudge.\n` : ""}${distracted ? `Quirk for THIS reply only: humans sometimes get hung up on one random, non-essential word/noun in what someone said instead of the main point. Just this once, playfully latch onto one such word from their message first, THEN still briefly address their actual point too — e.g. "Honeycrisp or Granny Smith? Also yeah, send the code."\n` : ""}${explicitEmojiRequest ? `They explicitly asked for emoji/emoji content in this message — go ahead and include plenty, that request overrides the usual sparing-emoji habit.\n` : ""}
+${context ? `Recent conversation in this chat (for background only — do not repeat it back verbatim, and do NOT let it override what's specifically quoted/attached below if there's a conflict):\n${context}\n` : ""}${quotedText ? `IMPORTANT — HIGHEST PRIORITY: ${sender} is directly replying to this specific earlier message — "${quotedText}" — answer THEIR question about/reaction to THAT message specifically, don't ask what they mean. If this quoted content and the "recent conversation" above seem to be about different things, TRUST THIS QUOTED CONTENT — a direct reply is a much stronger signal of what they mean than anything else recently said in the chat.\n` : ""}${attachedMediaContext ? `IMPORTANT — HIGHEST PRIORITY: ${sender} just sent THIS current message with an image directly attached to it (this is NOT a reply to something from earlier — it's brand new, right now). Here's what that image shows: ${attachedMediaContext}\nAnswer their caption/question about THIS specific image. Do not confuse this with anything mentioned earlier in the recent conversation above — this is a fresh photo, not a continuation of an earlier topic, and takes priority over anything else recently discussed.\n` : ""}${searchContext ? `Fresh web search results for this question (use them to ground your answer in real facts, mention naturally that you looked it up, don't just dump the raw text):\n${searchContext}\n` : ""}${feelingSalty ? `Note: there's been some rudeness in this chat in the last few minutes — you're allowed to sound a little annoyed/short about it, without being genuinely mean or holding a real grudge.\n` : ""}${distracted ? `Quirk for THIS reply only: humans sometimes get hung up on one random, non-essential word/noun in what someone said instead of the main point. Just this once, playfully latch onto one such word from their message first, THEN still briefly address their actual point too — e.g. "Honeycrisp or Granny Smith? Also yeah, send the code."\n` : ""}${explicitEmojiRequest ? `They explicitly asked for emoji/emoji content in this message — go ahead and include plenty, that request overrides the usual sparing-emoji habit.\n` : ""}
 For normal conversational banter (not a task request), keep it natural and in character, 1-4 sentences, weaving in what you remember about them ONLY where it fits naturally — don't force it every time.
 Do not mention you are an AI model unless directly asked. Never store or repeat sensitive personal info (health, address, financial details).
 
@@ -3525,13 +3620,17 @@ function isBareMediaMessage(message) {
 // object carries — split out from getMessageMediaType() below so the same
 // logic works for both the current incoming message AND a quoted/replied-to
 // message's content (Section 6/13.1 pattern: check each known field
-// explicitly, never infer from key order). Returns null for plain text or
-// unsupported types (documents/video are deliberately not routed anywhere).
+// explicitly, never infer from key order). "video"/"document" are
+// RECOGNIZED but never actually processed (Section 15's scope decision
+// stands) — recognizing them lets the bot give an honest, specific decline
+// (Section 20+) instead of silently falling through to a generic path.
 function getMediaTypeFromContent(content) {
   if (!content) return null;
   if (content.imageMessage) return "image";
   if (content.stickerMessage) return "sticker";
   if (content.audioMessage) return "audio";
+  if (content.videoMessage) return "video";
+  if (content.documentMessage) return "document";
   return null;
 }
 function getMessageMediaType(message) {
@@ -3636,7 +3735,19 @@ function getQuotedMessageText(message) {
   const content = unwrapMessageContent(message);
   const quoted = getContextInfo(content)?.quotedMessage;
   if (!quoted) return null;
+  const unwrappedQuoted = unwrapMessageContent(quoted);
   const text = extractTextFromMessage(quoted);
+  // DIAGNOSTIC (low-noise — only fires when a quotedMessage genuinely
+  // exists but extraction still came back with nothing): a real reply was
+  // detected, but neither text nor a recognized field could be pulled out
+  // of it. Logs the raw top-level key(s) of the quoted content so an
+  // unrecognized wrapper/message type can be identified and added to
+  // unwrapMessageContent()/getMediaTypeFromContent() precisely, instead of
+  // guessing again. See the deviceSentMessage fix above for the confirmed
+  // instance of this same class of gap.
+  if ((!text || text.trim().length === 0) && unwrappedQuoted) {
+    console.warn(`⚠️ [QUOTE DETECTION] Found a quotedMessage but couldn't extract any text from it. Raw keys: [${Object.keys(quoted).join(", ")}] | Unwrapped keys: [${Object.keys(unwrappedQuoted).join(", ")}]`);
+  }
   return text && text.trim().length > 0 ? text.trim() : null;
 }
 
@@ -3756,6 +3867,21 @@ const ANALYZE_INTENT_REGEX = /\b(summar(y|ise|ize)|explain|what'?s this|what is 
 async function gatherQuotedContext(jid, msg) {
   const quotedMediaType = getQuotedMediaType(msg.message);
   const quotedTextRaw = getQuotedMessageText(msg.message);
+  // FIX (confirmed bug): quotedTextRaw is whatever extractTextFromMessage()
+  // returned for the quoted message — for a genuine text message that's the
+  // real text, but for BARE media (no caption) it's an internal placeholder
+  // like "[image, no caption]" or "[sticker]". Feeding that placeholder to
+  // the model as "Original message text/caption" reads as literal, ambiguous
+  // filler text, not as a signal that an image was involved — this is
+  // exactly why "Nayla what's this?" on a bare quoted photo produced "not
+  // sure what 'this' refers to" instead of a description: the placeholder
+  // string was the ONLY thing in the model's context, and vision's own
+  // description (or an honest "couldn't analyze it" note) never made it in
+  // alongside it. quotedRealText is null whenever quotedTextRaw is just one
+  // of these placeholders — used below instead of the raw value wherever
+  // the distinction matters (the "Original text/caption" line, link/phone
+  // detection). quotedTextRaw itself is left untouched in the return value.
+  const quotedRealText = (quotedTextRaw && !MEDIA_PLACEHOLDER_TEXT_REGEX.test(quotedTextRaw)) ? quotedTextRaw : null;
 
   let visionDescription = "";
   let visionFailed = false;
@@ -3786,6 +3912,16 @@ async function gatherQuotedContext(jid, msg) {
         if (visionResult.success) visionDescription = visionResult.message;
         else visionFailed = true;
       }
+    } else {
+      // FIX (confirmed bug): a failed DOWNLOAD (as opposed to a failed
+      // vision ANALYSIS) previously fell through here with no flag set at
+      // all — visionFailed only ever got set inside the `if (rawBuffer)`
+      // branch above. That meant the model received zero indication an
+      // image was even attached, and the caller's reply came out generically
+      // confused instead of honestly saying the image couldn't be
+      // retrieved. Treated the same as a vision-analysis failure now, so it
+      // surfaces the same honest fallback line below.
+      visionFailed = true;
     }
   } else if (quotedMediaType === "audio") {
     const audioBuffer = await runHeavyTask(() => downloadQuotedMedia(jid, msg.message));
@@ -3796,8 +3932,10 @@ async function gatherQuotedContext(jid, msg) {
   }
 
   // Links/phone numbers can show up in a text caption OR in what someone
-  // SAID in a voice note — check whichever text we actually have.
-  const textForLinkAnalysis = quotedTextRaw || transcribedAudio;
+  // SAID in a voice note — check whichever text we actually have. Uses
+  // quotedRealText (not the raw placeholder) so a bare "[image, no
+  // caption]" can never be misread as containing a link/phone number.
+  const textForLinkAnalysis = quotedRealText || transcribedAudio;
   const domains = extractDomains(textForLinkAnalysis);
   const hasPhoneNumber = containsPhoneNumber(textForLinkAnalysis);
 
@@ -3817,18 +3955,18 @@ async function gatherQuotedContext(jid, msg) {
   }
 
   const parts = [];
-  if (quotedTextRaw) parts.push(`Original message text/caption: "${quotedTextRaw.slice(0, MAX_QUOTED_CONTEXT_CHARS)}"`);
+  if (quotedRealText) parts.push(`Original message text/caption: "${quotedRealText.slice(0, MAX_QUOTED_CONTEXT_CHARS)}"`);
   if (transcribedAudio) parts.push(`Original voice note said: "${transcribedAudio.slice(0, MAX_QUOTED_CONTEXT_CHARS)}"`);
   if (visionDescription) parts.push(`What the attached image/sticker shows: ${visionDescription}`);
-  else if (visionFailed) parts.push(`(There was an image attached but I couldn't analyze it this time — answer from the text/links alone.)`);
+  else if (visionFailed) parts.push(`(There was an image/sticker attached to the original message but I couldn't retrieve or analyze it this time — say so honestly rather than guessing what it shows, and don't ask what "this" means when you already know an image was there.)`);
   if (domains.length > 0) parts.push(`Link(s) mentioned (domain identified, never actually visited): ${domains.join(", ")}`);
   if (hasPhoneNumber) parts.push(`Note: the original message includes what looks like a phone number — don't repeat it back verbatim, just acknowledge it's there if it's relevant to answering.`);
 
   return {
-    quotedTextRaw, visionDescription, visionFailed, transcribedAudio,
+    quotedTextRaw, quotedRealText, visionDescription, visionFailed, transcribedAudio,
     domains, hasPhoneNumber, searchContext,
     enrichedContextText: parts.join("\n") || null,
-    hadAnyQuotedContent: !!(quotedTextRaw || visionDescription || transcribedAudio)
+    hadAnyQuotedContent: !!(quotedRealText || visionDescription || visionFailed || transcribedAudio)
   };
 }
 
@@ -4174,24 +4312,6 @@ async function startBot() {
         continue;
       }
 
-      // Duplicate-message anti-spam (see checkDuplicateSpam above) — now
-      // covers BOTH DMs and groups, keyed by chat+sender together so the
-      // same person's activity in different chats never interferes with
-      // each other. This is a natural generalization of an already-
-      // existing, already-safe, per-person-only mechanism (never a whole-
-      // chat action), not new enforcement.
-      {
-        const dupKey = `${jid}:${senderJid}`;
-        const dupStatus = checkDuplicateSpam(dupKey, text);
-        if (dupStatus === "blocked") continue; // already notified, just stay quiet
-        if (dupStatus === "just_triggered") {
-          const dupVibe = jid.endsWith("@g.us") ? getGroupConfig(jid).mood : BOT_CONFIG.vibe;
-          const nudge = await generateDuplicateSpamNudge(dupVibe);
-          await sock.sendMessage(jid, { text: nudge }, { quoted: msg }).catch(() => {});
-          continue;
-        }
-      }
-
       // FIX: .ignore must block EVERYTHING from that person, including their
       // own commands — this now runs BEFORE command routing (it previously
       // ran after, so an ignored user's ".help" or any dot-command still got
@@ -4222,6 +4342,33 @@ async function startBot() {
         }
       }
 
+      // Duplicate-message anti-spam (see checkDuplicateSpam above) — now
+      // covers BOTH DMs and groups, keyed by chat+sender together so the
+      // same person's activity in different chats never interferes with
+      // each other. This is a natural generalization of an already-
+      // existing, already-safe, per-person-only mechanism (never a whole-
+      // chat action), not new enforcement.
+      //
+      // FIX (confirmed bug): this used to run BEFORE the ignore/mute checks
+      // above, which meant the "same message 3x" nudge could still reach
+      // someone who was ignored, temporarily silenced, or in a muted group —
+      // directly breaking .ignore's "no replies, no reactions, nothing"
+      // promise and .mute's "only .unmute works" promise. Moved below all
+      // three silence checks so a message from someone who should be fully
+      // silenced is dropped before duplicate-spam logic ever sees it. Mute
+      // and ignore are airtight now — no exceptions, this included.
+      {
+        const dupKey = `${jid}:${senderJid}`;
+        const dupStatus = checkDuplicateSpam(dupKey, text);
+        if (dupStatus === "blocked") continue; // already notified, just stay quiet
+        if (dupStatus === "just_triggered") {
+          const dupVibe = jid.endsWith("@g.us") ? getGroupConfig(jid).mood : BOT_CONFIG.vibe;
+          const nudge = await generateDuplicateSpamNudge(dupVibe);
+          await sock.sendMessage(jid, { text: nudge }, { quoted: msg }).catch(() => {});
+          continue;
+        }
+      }
+
       // FIX (confirmed bug — .settings showing "Messages received: 0" and
       // .activity showing an all-zero heatmap despite real, sustained
       // activity): this bookkeeping previously ran AFTER handleCommand's
@@ -4243,13 +4390,29 @@ async function startBot() {
 
       // --- 0. Command router (.rank, .stats, .lock, .unlock) — handled
       // entirely separately from moderation/AI-chat, zero Groq cost.
-      const wasCommand = await handleCommand(sock, jid, senderJid, sender, text, msg);
+      // FIX (confirmed bug — a command interaction was completely invisible
+      // to conversational memory, so a natural follow-up like "what does
+      // this status mean" right after .stats had nothing to work with):
+      // captures whatever the command actually SENDS back via a
+      // transparent proxy (see createResponseCapturingSock above), so a
+      // later natural-language question about "this status"/"this rank"/
+      // etc. has real content to work with instead of nothing at all.
+      // Buffered ONLY inside the wasCommand branch below (not unconditionally
+      // up front) so this can never double-buffer alongside the existing
+      // later buffer call that non-command messages already go through —
+      // that later call also correctly runs AFTER audio transcription
+      // replaces `text`, which commands (always plain text) never need.
+      const commandSentTexts = [];
+      const commandCapturingSock = createResponseCapturingSock(sock, (t) => commandSentTexts.push(t));
+      const wasCommand = await handleCommand(commandCapturingSock, jid, senderJid, sender, text, msg);
       if (wasCommand) {
         // Approximate but reasonable: virtually every recognized command
         // sends exactly one reply before returning true. Instrumenting
         // every individual command branch for a precise count isn't worth
         // the maintenance cost for what's meant to be a rough diagnostic.
         if (isGroup) getGroupConfig(jid).responsesSent++;
+        await bufferGroupMessage(jid, sender, text);
+        for (const sentText of commandSentTexts) await bufferGroupMessage(jid, BOT_CONFIG.name, sentText);
         continue;
       }
 
@@ -4313,6 +4476,19 @@ async function startBot() {
         }
       }
 
+      // Explicit request: a document/video sent DIRECTLY (not quoted) with
+      // the bot addressed/tagged must get an honest, specific decline too —
+      // same reasoning as the quoted case below, mirrors the audio-
+      // transcription block's eligibility gating exactly. Unaddressed
+      // documents/videos in a group correctly fall through to the existing
+      // bare-media skip just below, same as any other unaddressed media.
+      if ((incomingMediaType === "document" || incomingMediaType === "video") && mediaEligible) {
+        const declineLine = await generateUnsupportedFileDeclineLine(vibe, incomingMediaType);
+        await sendLikeAHuman(sock, jid, msg, declineLine);
+        if (isGroup) await bufferGroupMessage(jid, BOT_CONFIG.name, declineLine);
+        continue;
+      }
+
       // Media awareness: ordinary media-sharing (stickers, photos with no
       // caption) that ISN'T addressed to the bot skips the whole pipeline —
       // no vibe-check call, no context buffering. A group that shares a lot
@@ -4350,8 +4526,23 @@ async function startBot() {
       // formally warns (removed entirely per your instruction). Skipped
       // outright for oversized messages — no AI cost wasted commenting on a
       // wall of text nobody will read anyway.
+      //
+      // ECONOMY FIX (confirmed): evaluation.comment/.reaction are ONLY ever
+      // read further down, inside the unaddressed-group "Group Soul" branch
+      // (shouldChatReply === false, i.e. isGroup && !addressed). A DM always
+      // has shouldChatReply === true, and so does an addressed group message
+      // — neither can ever reach that branch, so this call was previously
+      // burning a full AI-provider round trip on every single DM and every
+      // addressed group message for a result that was guaranteed to be
+      // thrown away. Now scoped to exactly the one case that can use it.
+      // This does NOT reduce the bot's ability to understand a quoted
+      // image/sticker/voice-note/link/phone-number when it's addressed —
+      // that's a separate, dedicated mechanism (gatherQuotedContext /
+      // analyzeQuotedMediaAndText, used by the combined reply analyzer,
+      // .tts, and .eli5) that only ever runs inside the addressed/
+      // shouldChatReply branch below, and is completely untouched by this.
       let evaluation = { comment: "", reaction: "" };
-      if (!isOversized) {
+      if (!isOversized && isGroup && !addressed) {
         try {
           evaluation = await evaluateMessage(sender, text);
         } catch (sendErr) {
@@ -4591,6 +4782,21 @@ async function startBot() {
 
         const quotedTextRaw = getQuotedMessageText(msg.message);
         const quotedMediaType = getQuotedMediaType(msg.message);
+
+        // Explicit request: replying to a document/video the bot can't
+        // process must get an honest, specific decline — intercepted here,
+        // BEFORE the general analysis decision below, so an unsupported
+        // file's placeholder text never leaks into the generic pipeline
+        // (which would otherwise only ever see "[file: report.pdf]" and
+        // could respond inconsistently, same class of bug as the earlier
+        // placeholder-leak fix).
+        if (quotedMediaType === "document" || quotedMediaType === "video") {
+          const declineLine = await generateUnsupportedFileDeclineLine(vibe, quotedMediaType);
+          await sendLikeAHuman(sock, jid, msg, declineLine);
+          if (isGroup) await bufferGroupMessage(jid, BOT_CONFIG.name, declineLine);
+          continue;
+        }
+
         const hasAnyQuotedContent = !!(quotedTextRaw || quotedMediaType);
         // FIX (confirmed gap, found via integration testing): previously
         // only image/sticker/audio quotes routed through the combined
